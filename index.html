@@ -522,38 +522,85 @@ function resetAll() {
   document.getElementById('fileInput').value='';
 }
 
+// ─── IMAGE COMPRESSION ─────────────────────────────────────────────
+// Resize to max 1024px and encode as JPEG @ 0.82 quality to stay well
+// within the API proxy's request-size limits.
+function compressToJpeg(b64, srcMime) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => {
+      const MAX = 1024;
+      let w = img.naturalWidth  || img.width;
+      let h = img.naturalHeight || img.height;
+      if (w === 0 || h === 0) { resolve({ b64, mime: 'image/jpeg' }); return; }
+      if (w > MAX || h > MAX) {
+        const r = Math.min(MAX / w, MAX / h);
+        w = Math.round(w * r);
+        h = Math.round(h * r);
+      }
+      const cv = document.createElement('canvas');
+      cv.width = w; cv.height = h;
+      cv.getContext('2d').drawImage(img, 0, 0, w, h);
+      const out = cv.toDataURL('image/jpeg', 0.82).split(',')[1];
+      resolve({ b64: out, mime: 'image/jpeg' });
+    };
+    img.onerror = () => resolve({ b64, mime: 'image/jpeg' }); // fall back silently
+    img.src = `data:${srcMime};base64,${b64}`;
+  });
+}
+
 // ─── ANALYSIS API CALL ─────────────────────────────────────────────
 async function callAPI(b64, mimeType) {
-  const safeMime=['image/jpeg','image/png','image/gif','image/webp'].includes(mimeType)?mimeType:'image/jpeg';
-  const res = await fetch(API_URL,{
-    method:'POST',
-    headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({
-      model:'claude-sonnet-4-20250514',
-      max_tokens:1000,
-      messages:[{role:'user',content:[
-        {type:'image',source:{type:'base64',media_type:safeMime,data:b64}},
-        {type:'text',text:`You are an expert AI image forensics analyst. Carefully examine this image for evidence of AI generation versus authentic photography or video frames.
+  const safeMime = ['image/jpeg','image/png','image/gif','image/webp'].includes(mimeType)
+    ? mimeType : 'image/jpeg';
 
-Analyze specifically:
-1. Texture uniformity — AI often produces unnaturally smooth or repetitive textures
-2. Facial features — uncanny symmetry, perfect skin, unrealistic hair detail
+  // Compress before sending
+  const { b64: smallB64, mime: finalMime } = await compressToJpeg(b64, safeMime);
+
+  const res = await fetch(API_URL, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'anthropic-version': '2023-06-01'
+    },
+    body: JSON.stringify({
+      model: 'claude-sonnet-4-20250514',
+      max_tokens: 1000,
+      messages: [{
+        role: 'user',
+        content: [
+          { type: 'image', source: { type: 'base64', media_type: finalMime, data: smallB64 } },
+          { type: 'text', text: `You are an expert AI image forensics analyst. Examine this image for evidence of AI generation versus authentic photography.
+
+Analyze:
+1. Texture uniformity — AI produces unnaturally smooth or repetitive textures
+2. Facial features — uncanny symmetry, flawless skin, unrealistic hair
 3. Background coherence — blur transitions, merging artifacts, inconsistencies
 4. Physics validity — lighting direction, shadow consistency, specular highlights
-5. Edge quality — unnatural smoothing, halo effects, transitions between objects
-6. Semantic coherence — hands, text, reflections, small details AI struggles with
-7. Natural imperfections — film grain, chromatic aberration, lens distortion, real noise
-8. Generative signatures — typical diffusion model or GAN fingerprints
+5. Edge quality — unnatural smoothing, halo effects, object boundaries
+6. Semantic coherence — hands, text, reflections, fine details AI struggles with
+7. Natural imperfections — film grain, chromatic aberration, lens distortion
+8. Generative signatures — diffusion model or GAN fingerprints
 
-Return ONLY a single valid JSON object (no markdown, no backticks, no text outside braces):
-{"ai_probability":<int 0-100>,"authenticity_probability":<int 0-100>,"confidence":"<low|medium|high>","verdict":"<Highly Likely AI Generated|Likely AI Generated|Possibly AI Generated|Inconclusive|Likely Authentic|Highly Likely Authentic>","indicators":[<3 to 6 specific indicator strings>],"analysis":"<2-3 sentence technical summary of key evidence>"}`}
-      ]}]
+Return ONLY valid JSON (no markdown, no backticks, nothing outside the braces):
+{"ai_probability":<int 0-100>,"authenticity_probability":<int 0-100>,"confidence":"<low|medium|high>","verdict":"<Highly Likely AI Generated|Likely AI Generated|Possibly AI Generated|Inconclusive|Likely Authentic|Highly Likely Authentic>","indicators":[<3 to 6 short indicator strings>],"analysis":"<2-3 sentence technical explanation>"}` }
+        ]
+      }]
     })
   });
-  if(!res.ok) throw new Error(`API ${res.status}: ${res.statusText}`);
-  const data=await res.json();
-  const txt=data.content.map(b=>b.text||'').join('').replace(/```json|```/g,'').trim();
-  return JSON.parse(txt);
+
+  if (!res.ok) {
+    let detail = res.statusText;
+    try { const e = await res.json(); detail = e?.error?.message || JSON.stringify(e); } catch(_) {}
+    throw new Error(`API ${res.status}: ${detail}`);
+  }
+
+  const data = await res.json();
+  const txt = data.content.map(b => b.text || '').join('').replace(/```json|```/g, '').trim();
+  // Extract first {...} block in case model adds surrounding text
+  const match = txt.match(/\{[\s\S]*\}/);
+  if (!match) throw new Error('Model returned non-JSON response');
+  return JSON.parse(match[0]);
 }
 
 // ─── RUN ANALYSIS ──────────────────────────────────────────────────
